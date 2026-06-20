@@ -152,52 +152,76 @@ def bing_call(method):
     key = os.environ["BING_API_KEY"]
     url = f"{BING_BASE}/{method}?apikey={key}&siteUrl={BING_SITE}"
     r = requests.get(url, timeout=60)
+    print(f"  {method}: HTTP {r.status_code}")
     r.raise_for_status()
-    return r.json().get("d", [])
+    data = r.json()
+    rows = data.get("d", [])
+    print(f"    {len(rows)} raw rows returned by Bing")
+    if rows:
+        print(f"    sample row fields: {list(rows[0].keys())}")
+    else:
+        # show a snippet of whatever Bing actually sent, to diagnose
+        print(f"    response snippet: {str(data)[:300]}")
+    return rows
 
 
 def bing_ms_to_date(s):
-    # Bing returns dates like "/Date(1399100400000)/"
-    ms = int(s.replace("/Date(", "").replace(")/", "").split("-")[0].split("+")[0])
-    return dt.datetime.utcfromtimestamp(ms / 1000).date()
+    # Bing returns dates like "/Date(1399100400000)/" or "/Date(...-0700)/"
+    inner = s.replace("/Date(", "").replace(")/", "")
+    for sep in ("+", "-"):
+        if sep in inner:
+            inner = inner.split(sep)[0]
+    return dt.datetime.utcfromtimestamp(int(inner) / 1000).date()
 
 
-def bing_summarize(rows, label_field):
-    """Bing returns ~6 months of daily rows. Filter to last 28 days and aggregate."""
+def bing_summarize(rows, source_field, out_label):
+    """Bing returns months of daily rows. Filter to last 28 days and aggregate."""
     cutoff = TODAY - dt.timedelta(days=28)
     agg = {}
+    kept = 0
     for row in rows:
-        d = bing_ms_to_date(row["Date"])
+        try:
+            d = bing_ms_to_date(row["Date"])
+        except Exception:
+            continue
         if d < cutoff:
             continue
-        key = row[label_field]
+        kept += 1
+        key = row.get(source_field)
         a = agg.setdefault(key, {"Clicks": 0, "Impressions": 0, "pos_weighted": 0.0})
-        clicks = row.get("Clicks", 0)
-        impr = row.get("Impressions", 0)
+        clicks = row.get("Clicks", 0) or 0
+        impr = row.get("Impressions", 0) or 0
         # AvgImpressionPosition is historically returned x10 by this API
-        pos = row.get("AvgImpressionPosition", 0) / 10.0
+        pos = (row.get("AvgImpressionPosition", 0) or 0) / 10.0
         a["Clicks"] += clicks
         a["Impressions"] += impr
         a["pos_weighted"] += pos * impr
+    print(f"    rows within last 28 days: {kept}; unique {out_label}: {len(agg)}")
+
     records = []
     for key, a in agg.items():
         impr = a["Impressions"]
         records.append({
-            label_field: key,
+            out_label: key,
             "Clicks": a["Clicks"],
             "Impressions": impr,
             "CTR": round(100 * a["Clicks"] / impr, 2) if impr else 0,
             "AvgPosition": round(a["pos_weighted"] / impr, 1) if impr else 0,
         })
-    df = pd.DataFrame(records).sort_values("Clicks", ascending=False)
+
+    # Force columns to exist even when there are no records (prevents the crash)
+    cols = [out_label, "Clicks", "Impressions", "CTR", "AvgPosition"]
+    df = pd.DataFrame(records, columns=cols)
+    if not df.empty:
+        df = df.sort_values("Clicks", ascending=False)
     return df
 
 
 def run_bing():
     print("Bing Webmaster Tools...")
-    save(bing_summarize(bing_call("GetQueryStats"), "Query"),
+    save(bing_summarize(bing_call("GetQueryStats"), "Query", "Query"),
          "Bing_Search_Performance.xlsx")
-    save(bing_summarize(bing_call("GetPageStats"), "Query"),  # Bing labels the URL field "Query"
+    save(bing_summarize(bing_call("GetPageStats"), "Query", "Page"),
          "Bing_Page_Performance.xlsx")
 
 
